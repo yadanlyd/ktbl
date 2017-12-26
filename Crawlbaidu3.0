@@ -1,0 +1,423 @@
+'''
+（优化）多线程
+问题：存在死锁
+'''
+import urllib.request
+from bs4 import BeautifulSoup
+import pymysql
+import re
+import time
+import threading
+
+# 如果每一个队列里的东西不为空，则下一个函数可以开始运行
+
+
+class Crawlbaidu():
+    
+    rkey = ['科研申报'] #存放已经爬取过的相关搜索关键字
+    dedup = [] #保存第二次过滤链接，用于去重
+    rURL = [("http://www.baidu.com/s?wd=%E7%A7%91%E7%A0%94%E7%94%B3%E6%8A%A5&tn=94739417_hao_pg&ssl_sample=hao_1","科研申报")] #保存第二次过滤百度域内的结果
+
+    net = "http://www.baidu.com"
+
+    index=[0]
+    
+    # 过滤词
+    stopWords = ['公示','名单','结项','防范','评选','调查','结果','撤项','调整','会议','召开','评估','终止',
+                 '立项','邀请','百度','如何','模板','怎样','注意事项','提供','辅导','收费','博客','豆丁','新浪'
+                 '道客巴巴','范文','软件','攻略']
+    chooseWords = ['申报','通知','重大','项目','指南','通告','招标','课题','征集','选题','平台','信息','科学部','科学技术部']
+
+    def __init__(self,page_total,url,flag,conn,cur):
+        self.page_total = page_total #获取链接的总页数  
+        self.page_num = 0 #当前运行的页码  
+        self.url =url # 第一次爬取的链接
+        
+        self.all_url = [] #所有a标签下的url
+        self.all_title = [] #所有a标签下的url的标题
+        self.qURL = [] #保存第一次词库过滤结果
+        self.dURL = [] #保存第二次过滤非百度域内的结果
+
+        self.flag = flag #去重的参数
+        self.conn = conn
+        self.cur = cur
+
+        # all_url,all_title 的锁和信号量
+        self.lock_url_title = threading.Lock()
+        self.sem_url_title = threading.Semaphore(value = 0)
+        self.tag_all = 0
+
+        # qURL的锁和信号量
+        self.lock_qurl = threading.Lock()
+        self.sem_qurl = threading.Semaphore(value=0)
+        self.tag_qurl = 0
+
+        # dURL的锁和信号量
+        self.lock_durl = threading.Lock()
+        self.sem_durl = threading.Semaphore(value=0)
+        self.tag_durl = 0
+
+        # dedup的锁和信号量
+        self.lock_dedup = threading.Lock()
+        self.sem_dedup = threading.Semaphore(value=0)
+        self.tag_dedup = 0
+
+        self.thread_3 = 5 #第二次过滤：找到真正的网址，新开辟的线程数
+        self.q = 0 # 计数值
+        self.lock_q = threading.Lock() #为q值加的锁
+    
+    def visitBaidu(self):
+        #print("visitbaidu start time:",time.clock())
+        # 从百度获取所有链接
+        k = self.page_num
+        for i in range(k,self.page_total):
+            # 爬取本页的源代码
+            try:
+                page = "&pn="+str(10*i)
+                if i==0:
+                    page = ""
+                url=self.url+page
+                data=urllib.request.urlopen(url).read()
+
+                # 提取网址和标题
+                soup = BeautifulSoup(data, "lxml")
+                for link in soup.find_all('a'):
+                    self.lock_url_title.acquire()
+                    self.all_url.append(link.get('href'))
+                    self.all_title.append(link.get_text())
+                    self.lock_url_title.release()
+                    self.sem_url_title.release()
+                self.page_num+=1
+                #print("self.page_num",self.page_num)
+            except Exception:
+                continue
+            
+        self.tag_all=1
+        # print(self.all_url)
+        #print("all_url",len(self.all_url))
+        #print("visitbaidu end time:", time.clock())
+
+    def Filtration(self):
+        # 第一次过滤：符合词库条件的链接压入列表
+        #print("Filtration start time:", time.clock())
+        i=0
+        while self.tag_all==0:
+            self.sem_url_title.acquire()
+            self.lock_url_title.acquire()
+            url = self.all_url[i]
+            title = self.all_title[i]
+            self.lock_url_title.release()
+
+            stopword_appear,chooseword_appear = 0,0
+            for s in self.stopWords:
+                if s in title:
+                     stopword_appear+=1
+            for c in self.chooseWords:
+                if c in title:
+                    chooseword_appear+=1
+             # 测试结果是选择词大于2，准确率会更高
+            if chooseword_appear>=1 and stopword_appear<=0:
+                # 存入队列
+                self.lock_qurl.acquire()
+                self.qURL.append((url, title))
+                self.lock_qurl.release()
+                self.sem_qurl.release()
+            #print(len(self.qURL))
+            i+=1
+
+        while i<len(self.all_url):
+            url = self.all_url[i]
+            title = self.all_title[i]
+
+            stopword_appear, chooseword_appear = 0, 0
+            for s in self.stopWords:
+                if s in title:
+                    stopword_appear += 1
+            for c in self.chooseWords:
+                if c in title:
+                    chooseword_appear += 1
+                    # 测试结果是选择词大于2，准确率会更高
+            if chooseword_appear >= 1 and stopword_appear <= 0:
+                # 存入队列
+                self.lock_qurl.acquire()
+                self.qURL.append((url, title))
+                self.lock_qurl.release()
+                self.sem_qurl.release()
+            i += 1
+        self.tag_qurl=1
+        #print("qURL", len(self.qURL))
+        #print("Filtration end time:", time.clock())
+
+    
+        
+    def DirectURL(self):
+        #print("DirectURL start time:", time.clock())
+        #第二次过滤：将真正的网址保存在列表里
+        q = 0
+        while self.tag_qurl==0:
+            
+            try:
+                # rURL列表保存百度的相关搜索链接
+                
+                self.sem_qurl.acquire()
+                self.lock_qurl.acquire()
+                
+                url = self.qURL[q][0]
+                title = self.qURL[q][1]
+                self.lock_qurl.release()
+                if "http" not in url and "https" not in url:
+                    if title not in self.rkey:
+                        self.rURL.append((self.net+url,title))
+                        self.rkey.append(title)
+                        #print("Q",q,"len",len(self.qURL),url)
+                    q=q+1
+                    continue
+                    
+                # 找到第一次过滤的链接指向的真正的页面链接
+                #print(url)
+                u=urllib.request.urlopen(url)
+                lurl=u.geturl()
+                
+                # 去掉仍是百度局域内的网址
+                if "baidu.com" not in lurl:
+                    self.lock_durl.acquire()
+                    self.dURL.append((lurl,title))
+                    self.lock_durl.release()
+                    self.sem_durl.release()
+                else:
+                    # 若网址仍在百度域内，存在两种情况：
+                    # 1、返回了请求的真正的网址（正则表达式匹配）；
+                    # 2、返回页面源码（此类网址应删去）
+                    data3=u.read()
+                    p=re.compile(b'(?<=URL=\').*?(?=\'"></noscript>)')
+                    a=p.search(data3)
+                    if a:
+                        self.lock_durl.acquire()
+                        self.dURL.append((a.group(0),title))
+                        self.lock_durl.release()
+                        self.sem_durl.release()
+
+                #print("q",q,"len",len(self.qURL),url)
+            except Exception:
+                q+=1
+                #print("E",q ,"len",len(self.qURL),url)
+                continue
+            q += 1
+
+        
+        while q<len(self.qURL):
+           
+            try:
+                url = self.qURL[q][0]
+                title = self.qURL[q][1]
+                if "http" not in url and "https" not in url:
+                    if title not in self.rkey:
+                        self.rURL.append((self.net + url, title))
+                        self.rkey.append(title)
+                        #print("Q",q,"len",len(self.qURL),url)
+                    q=q+1
+                    continue
+
+                # 找到第一次过滤的链接指向的真正的页面链接
+                #print(url)
+                u = urllib.request.urlopen(url)
+                lurl = u.geturl()
+
+                # 去掉仍是百度局域内的网址
+                if "baidu.com" not in lurl:
+
+                    self.lock_durl.acquire()
+                    self.dURL.append((lurl, title))
+                    self.lock_durl.release()
+                    self.sem_durl.release()
+
+
+                else:
+                    # 若网址仍在百度域内，存在两种情况：
+                    # 1、返回了请求的真正的网址（正则表达式匹配）；
+                    # 2、返回页面源码（此类网址应删去）
+                    data3 = u.read()
+                    p = re.compile(b'(?<=URL=\').*?(?=\'"></noscript>)')
+                    a = p.search(data3)
+                    if a:
+                        self.lock_durl.acquire()
+                        self.dURL.append((a.group(0), title))
+                        self.lock_durl.release()
+                        self.sem_durl.release()
+
+                #print("q",q ,"len",len(self.qURL),url)
+            except Exception:
+                q+=1
+                #print("E",q ,"len",len(self.qURL),url)
+                continue
+            q += 1
+        self.tag_durl = 1
+        #print("dURL", len(self.dURL))
+        #print("DirectURL end time:", time.clock())
+
+    def thread_DirectURL(self):
+        for i in range(self.thread_3):
+            t = threading.Thread(target=self.DirectURL)
+
+        
+    def Deduplication(self):
+        #print("Deduplication start time:", time.clock())
+
+        # 去重，将已经过滤好的网站，截取保留网站的首页链接
+        # for d in self.dURL:
+        d=0
+        while self.tag_durl==0:
+            #print("d",d,'len',len(self.dURL))
+            self.sem_durl.acquire()
+            self.lock_durl.acquire()
+            url = self.dURL[d][0]
+            title = self.dURL[d][1]
+            self.lock_durl.release()
+
+            rex = re.compile('http://.*?/|https://.*?/')
+            aex = rex.search(url)
+            # 功能一：按url去重
+            if self.flag==1:
+                t = aex.group(0)
+                tempurl = []
+
+                self.lock_dedup.acquire()
+                for de in self.dedup:
+                    tempurl.append(de[0])
+                if t not in tempurl:
+                    self.dedup.append((t,title))
+                    self.sem_dedup.release()
+                self.lock_dedup.release()
+                
+
+            # 功能二：按url、title共同去重
+            elif self.flag==2:
+                t = (aex.group(0),title)
+
+                self.lock_dedup.acquire()
+                if t not in self.dedup:
+                    self.dedup.append(t)
+                    self.sem_dedup.release()
+                self.lock_dedup.release()
+                
+            d+=1
+
+        while d<len(self.dURL):
+            url = self.dURL[d][0]
+            title = self.dURL[d][1]
+
+            rex = re.compile('http://.*?/|https://.*?/')
+            aex = rex.search(url)
+            # 功能一：按url去重
+            if self.flag == 1:
+                t = aex.group(0)
+                tempurl = []
+                self.lock_dedup.acquire()
+                for de in self.dedup:
+                    tempurl.append(de[0])
+                if t not in tempurl:
+                    self.dedup.append((t, title))
+                    self.sem_dedup.release()
+                self.lock_dedup.release()
+                
+            # 功能二：按url、title共同去重
+            elif self.flag == 2:
+                t = (aex.group(0), title)
+                self.lock_dedup.acquire()
+                if t not in self.dedup:
+                    self.dedup.append(t)
+                    self.sem_dedup.release()
+                self.lock_dedup.release()
+                
+            d += 1
+        self.tag_dedup = 1
+        #print("dedup", len(self.dedup))
+        #print("Deduplication end time:", time.clock())
+
+
+    def Savesql(self):
+        #print("Savesql start time:", time.clock())
+
+        #存入数据库
+        # dlen = len(self.dedup)
+        i=self.index[0]
+        d = i
+        # for d in range(i,dlen):
+        while self.tag_dedup==0:
+            
+            self.sem_dedup.acquire()
+            self.lock_dedup.acquire()
+            #print("d",d,"len",len(self.dedup))
+            param = (d , self.dedup[d][0] , self.dedup[d][1])
+            self.lock_dedup.release()
+            sql = "insert into ktbl (url_id,url,title) values(%s,%s,%s)"
+            self.cur.execute(sql, param)
+            self.conn.commit()
+            self.index[0]=self.index[0]+1
+            d+=1
+
+        while d<len(self.dedup):
+            param = (d , self.dedup[d][0] , self.dedup[d][1])
+            sql = "insert into ktbl (url_id,url,title) values(%s,%s,%s)"
+            self.cur.execute(sql, param)
+            self.conn.commit()
+            self.index[0]=self.index[0]+1
+            d+=1
+
+        #print("Savesql end time:", time.clock())
+            
+    def Startcrawl(self):
+        threads = []
+        t1 = threading.Thread(target=self.visitBaidu)
+        threads.append(t1)
+        t2 = threading.Thread(target=self.Filtration)
+        threads.append(t2)
+        t3 = threading.Thread(target=self.DirectURL)
+        threads.append(t3)
+        t4 = threading.Thread(target=self.Deduplication)
+        threads.append(t4)
+        # t5 = threading.Thread(target=self.Savesql)
+        # threads.append(t5)
+
+        for t in threads:
+            t.setDaemon(True)
+            t.start()
+        t.join()
+
+        '''
+        self.visitBaidu()
+        self.Filtration()
+        self.DirectURL()
+        self.Deduplication()
+        self.Savesql()
+        '''
+
+
+#数据库链接
+conn= pymysql.connect(
+        host='localhost',
+        port=3306,
+        user='root',
+        passwd='009795',
+        db='pythonsql',
+        charset='utf8',
+        cursorclass=pymysql.cursors.DictCursor,
+        )
+cur = conn.cursor()
+
+
+
+count=0
+start = time.clock()
+for r in Crawlbaidu.rURL:
+    count+=1
+    s = Crawlbaidu(5,r[0],1,conn,cur)
+    s.Startcrawl()
+    print(count)
+    if count==1:
+        break
+
+end = time.clock()
+print("多线程用时为：",end - start,'s')
+
+conn.close()
